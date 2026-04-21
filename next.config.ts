@@ -1,7 +1,8 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  // This tells Turbopack to leave Prisma strictly on the server
+  serverExternalPackages: ['@prisma/client'],
 };
 
 export default nextConfig;
