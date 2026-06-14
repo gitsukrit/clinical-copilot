@@ -3,28 +3,29 @@ export const runtime = 'nodejs';
 import { NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '../../../lib/authOptions';
-import { prisma } from '../../../lib/prisma';
+import { getTenantPrisma } from '../../../lib/prisma';
+
+const TENANT_ID = '56d66db8-42da-4cb2-aea7-f91ae85f19f7';
 
 export async function POST(request: Request) {
-  // Auth gate: block unauthenticated requests
   const authSession = await getServerSession(authOptions);
   if (!authSession?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  // physician_id comes from the verified server session, never from the client payload
   const physician_id = authSession.user.id;
 
   try {
     const body = await request.json();
-    const { tenant_id, session_id, justification } = body;
+    const { tenant_id, session_id, justification, hpi_draft, icd10_codes, patient_name, patient_mrn } = body;
 
     if (!justification || justification.length < 10) {
       return NextResponse.json({ error: "Valid justification required" }, { status: 400 });
     }
 
-    // Fetch the secure URL directly from the database
-    const session = await prisma.triage_sessions.findUnique({
+    const db = getTenantPrisma(TENANT_ID);
+
+    const session = await db.triage_sessions.findUnique({
       where: { id: session_id },
       select: { resume_url: true }
     });
@@ -35,17 +36,11 @@ export async function POST(request: Request) {
 
     const secure_resume_url = session.resume_url;
 
-    // Database Transaction: Update status, write audit log, and DESTROY the token
-    await prisma.$transaction(async (tx) => {
+    // Database Transaction: Update status, write audit log, DESTROY token, and WRITE TO EHR
+    await db.$transaction(async (tx) => {
       const updateResult = await tx.triage_sessions.updateMany({
-        where: {
-          id: session_id,
-          status: 'processing' // Optimistic concurrency guard
-        },
-        data: {
-          status: 'approved_by_doctor',
-          resume_url: null // Instantly invalidate the token so it cannot be reused
-        }
+        where: { id: session_id, status: 'processing' },
+        data: { status: 'approved_by_doctor', resume_url: null }
       });
 
       if (updateResult.count === 0) {
@@ -56,17 +51,31 @@ export async function POST(request: Request) {
         data: {
           tenant_id: tenant_id,
           session_id: session_id,
-          physician_id: physician_id, // sourced from server session, not client payload
+          physician_id: physician_id,
           action_taken: 'MANUAL_OVERRIDE_AUTHORIZED',
           override_justification: justification,
         }
       });
+
+      // NEW: Prisma EHR Write-Back integrated into the transaction
+      if (hpi_draft) {
+        await tx.patient_history.create({
+          data: {
+            patient_mrn: patient_mrn || 'UNKNOWN',
+            patient_name: patient_name || 'UNKNOWN',
+            hpi_record: hpi_draft,
+            icd10_codes: icd10_codes || [],
+          }
+        });
+      }
     });
 
-    // Thaw the n8n pipeline using the secure DB URL
     const n8nResponse = await fetch(secure_resume_url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "x-webhook-secret": process.env.N8N_WEBHOOK_SECRET ?? '',
+      },
       body: JSON.stringify({
         status: "approved_by_doctor",
         justification: justification,
@@ -78,15 +87,13 @@ export async function POST(request: Request) {
       throw new Error("Failed to thaw n8n pipeline");
     }
 
-    return NextResponse.json({ success: true, message: "Override logged and pipeline resumed." });
+    return NextResponse.json({ success: true, message: "Override logged, EHR updated, and pipeline resumed." });
 
   } catch (error: any) {
     console.error("Override API Error:", error);
-
     if (error.message?.includes("RACE_CONDITION")) {
       return NextResponse.json({ error: "This session has already been reviewed by another physician." }, { status: 409 });
     }
-
     return NextResponse.json({ error: "Internal Server Error" }, { status: 500 });
   }
 }
